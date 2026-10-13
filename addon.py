@@ -1196,6 +1196,10 @@ class BlenderMCPServer:
         # Live client sockets, so stop() can unblock threads parked in recv().
         self._clients = set()
         self._clients_lock = threading.Lock()
+        # Commands queued per client and not yet answered, and clients whose
+        # handler saw EOF (half-close) while a reply was still owed.
+        self._pending = {}
+        self._half_closed = set()
 
     def _get_config_value(self, scene_attr, pref_attr=None, env_var=None):
         """Read config in order: addon preferences -> scene -> env var."""
@@ -1328,6 +1332,8 @@ class BlenderMCPServer:
         with self._clients_lock:
             clients = list(self._clients)
             self._clients.clear()
+            self._pending.clear()
+            self._half_closed.clear()
         for client in clients:
             try:
                 client.shutdown(socket.SHUT_RDWR)
@@ -1416,8 +1422,27 @@ class BlenderMCPServer:
                 client.sendall(response_json.encode('utf-8'))
             except Exception:
                 print("Failed to send response - client disconnected")
+            self._reply_done(client)
 
         return 0.05
+
+    def _reply_done(self, client):
+        """Note that one queued command was answered; close a drained,
+        half-closed client now that nothing more is owed to it."""
+        with self._clients_lock:
+            left = self._pending.get(client, 0) - 1
+            if left > 0:
+                self._pending[client] = left
+                return
+            self._pending.pop(client, None)
+            if client not in self._half_closed:
+                return
+            self._half_closed.discard(client)
+            self._clients.discard(client)
+        try:
+            client.close()
+        except Exception:
+            pass
 
     def _handle_client(self, client):
         """Handle connected client"""
@@ -1448,6 +1473,8 @@ class BlenderMCPServer:
                         # bpy.app.timers.register() from here - it is not
                         # thread-safe and the callback can be silently lost.
                         print(f"Queued command: {command.get('type')}")
+                        with self._clients_lock:
+                            self._pending[client] = self._pending.get(client, 0) + 1
                         self.command_queue.put((command, client))
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         # Incomplete data, wait for more. A multi-byte UTF-8
@@ -1465,11 +1492,22 @@ class BlenderMCPServer:
             print(f"Error in client handler: {str(e)}")
         finally:
             with self._clients_lock:
-                self._clients.discard(client)
-            try:
-                client.close()
-            except:
-                pass
+                # EOF only means the client is done sending (it may have
+                # half-closed with shutdown(SHUT_WR) and still be reading).
+                # Replies are written by the main thread later, so leave the
+                # socket open until the last one has gone out.
+                if self.running and self._pending.get(client, 0) > 0:
+                    self._half_closed.add(client)
+                    keep_open = True
+                else:
+                    self._pending.pop(client, None)
+                    self._clients.discard(client)
+                    keep_open = False
+            if not keep_open:
+                try:
+                    client.close()
+                except:
+                    pass
             print("Client handler stopped")
 
     def execute_command(self, command):
