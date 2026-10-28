@@ -21,11 +21,46 @@ from bpy.props import IntProperty, BoolProperty
 import io
 from datetime import datetime
 import hashlib, hmac, base64
+import ipaddress
 import os.path as osp
 from collections import deque
-from urllib.parse import quote, urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import quote, urlencode, urljoin, urlparse, urlunparse, parse_qsl
 from contextlib import contextmanager, redirect_stdout, suppress
 from bpy.app.handlers import persistent
+
+
+def _assert_public_http_url(url):
+    """Raise ValueError unless url is http(s) and every address its host
+    resolves to is a public one (no loopback, private, link-local, metadata)."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"Unsupported image URL: {url}")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise ValueError(f"Cannot resolve image host {parsed.hostname}: {e}")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        if not ip.is_global:
+            raise ValueError(f"Refusing to fetch image from non-public address {ip}")
+
+
+def _download_public_image(url, max_redirects=5):
+    """GET an image URL, validating the initial URL and every redirect hop."""
+    for _ in range(max_redirects + 1):
+        _assert_public_http_url(url)
+        res = requests.get(url, timeout=30, allow_redirects=False)
+        if res.status_code in (301, 302, 303, 307, 308):
+            location = res.headers.get("Location")
+            if not location:
+                raise ValueError("Redirect without Location header")
+            url = urljoin(url, location)
+            continue
+        res.raise_for_status()
+        return res.content
+    raise ValueError("Too many redirects while downloading image")
 
 bl_info = {
     "name": "MCP for Blender",
@@ -4870,9 +4905,8 @@ class BlenderMCPServer:
             if image:
                 if re.match(r'^https?://', image, re.IGNORECASE) is not None:
                     try:
-                        resImg = requests.get(image, timeout=30)
-                        resImg.raise_for_status()
-                        image_base64 = base64.b64encode(resImg.content).decode("ascii")
+                        image_bytes = _download_public_image(image)
+                        image_base64 = base64.b64encode(image_bytes).decode("ascii")
                         data["image"] = image_base64
                     except Exception as e:
                         return {"error": f"Failed to download or encode image: {str(e)}"} 
